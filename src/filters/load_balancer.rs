@@ -230,9 +230,35 @@ policy: HASH
                 .len(),
         );
 
+        // Run a few selection rounds through the address
+        // this time vary the port for a single IP
+        let mut result_sequences = vec![];
+        for port in &source_ports {
+            let sequence = (0..addresses.len())
+                .map(|_|
+                    get_response_addresses(filter.as_ref(),
+                                           &addresses,
+                                           format!("127.0.0.1:{}",port).parse().unwrap())
+                )
+                .collect::<Vec<_>>();
+            result_sequences.push(sequence);
+        }
+
+        // Verify that more than 1 path was picked
+        assert_ne!(
+            1,
+            result_sequences
+                .clone()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .collect::<HashSet<_>>()
+                .len(),
+        );
+
         // Run a few selection rounds through the addresses
         // This time vary the source IP and port
-        let mut result_sequence2 = vec![];
+        let mut result_sequences = vec![];
         for ip in source_ips {
             for port in &source_ports {
                 let sequence = (0..addresses.len())
@@ -242,14 +268,14 @@ policy: HASH
                                                format!("{}:{}",ip,port).parse().unwrap())
                     )
                     .collect::<Vec<_>>();
-            result_sequence2.push(sequence);
+            result_sequences.push(sequence);
             }
         }
 
         // Check that every address was chosen at least once.
         assert_eq!(
             addresses.into_iter().collect::<HashSet<_>>(),
-            result_sequence2
+            result_sequences
                 .clone()
                 .into_iter()
                 .flatten()
@@ -259,7 +285,7 @@ policy: HASH
 
         // Check that there is at least one different sequence of addresses.
         assert!(
-            &result_sequence2[1..]
+            &result_sequences[1..]
                 .iter()
                 .any(|seq| seq != &result_sequences[0]),
             "the same sequence of addresses were chosen for hash load balancer"
