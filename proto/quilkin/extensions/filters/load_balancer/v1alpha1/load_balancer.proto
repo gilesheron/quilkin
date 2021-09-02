@@ -23,6 +23,7 @@ message LoadBalancer {
     RoundRobin = 0;
     Random = 1;
     Hash = 2;
+    Api = 3;
   }
 
   message PolicyValue {

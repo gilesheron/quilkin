@@ -10,3 +10,6 @@
 [submodule "proto/googleapis"]
 	path = proto/googleapis
 	url = https://github.com/googleapis/googleapis.git
+[submodule "proto/msm"]
+	path = proto/msm
+	url = https://github.com/media-streaming-mesh/msm-rtsp-cp

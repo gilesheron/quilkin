@@ -18,11 +18,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rand::{thread_rng, Rng};
 
+crate::include_proto!("endpoint");
+use self::endpoint::get_endpoint_client::GetEndpointClient;
+use self::endpoint::EndpointRequest;
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 
-use crate::endpoint::UpstreamEndpoints;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::endpoint::{UpstreamEndpoints, RetainedItems};
 
 /// EndpointChooser chooses from a set of endpoints that a proxy is connected to.
 pub trait EndpointChooser: Send + Sync {
@@ -75,5 +81,121 @@ impl EndpointChooser for HashEndpointChooser {
         from.hash(&mut hasher);
         endpoints.keep(hasher.finish() as usize % num_endpoints)
             .expect("BUG: unwrap should have been safe because index into endpoints list should be in range");
+    }
+}
+
+/// ControlPlaneEndpointChooser chooses endpoints from a Control Plane API Call
+pub struct ApiEndpointChooser {
+    txmt: mpsc::Sender<(SocketAddr, oneshot::Sender<SocketAddr>)>,
+}
+
+impl ApiEndpointChooser {
+    pub fn new() -> Self {
+        println!("new API chooser");
+        let (tx, rx) = mpsc::channel::<(SocketAddr, oneshot::Sender<SocketAddr>)>(32);
+        tokio::spawn(async {
+            ApiEndpointChooser::run(rx).await;
+        });
+        ApiEndpointChooser { txmt: tx.clone() }
+    }
+
+    async fn run(mut rx: mpsc::Receiver<(SocketAddr, oneshot::Sender<SocketAddr>)>) {
+        match GetEndpointClient::connect("http://127.0.0.1:50051").await {
+            Ok(mut client) => {
+                println!("connected to API");
+                loop {
+                    println!("entering loop");
+
+                    let _result = match rx.recv().await {
+                        Some((message, channel)) => {
+                            println!("got message");
+
+                            let request = tonic::Request::new(
+                                EndpointRequest {
+                                    req: message.to_string(),
+                                }
+                            );
+
+                            match client.send(request).await {
+                                Ok(response) => {
+                                    println!("RESPONSE={:?}", response);
+
+                                    let msg = response.into_inner();
+                                    match msg.res.parse() {
+                                        Ok(socket_addr) => {
+                                            match channel.send(socket_addr) {
+                                                Ok(()) => {
+                                                    println!("Response sent ok");
+                                                }
+                                                Err(e) => {
+                                                    println!("Error {:?} sending response {:?}", e, socket_addr);
+                                                }
+                                            }
+                                        },
+                                        Err(e) => {
+                                            println!("Error converting response to SocketAddr {:?}", e);
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    println!("Send Error {:?}", e);
+                                },
+                            }
+                        },
+                        None => {
+                            println!("No message received");
+                        }
+                    };
+                }
+            },
+            Err(e) => {
+                println!("Connect Error {:?}", e);
+            },
+        };
+    }
+
+    async fn get(receiver: oneshot::Receiver<SocketAddr>) -> SocketAddr {
+        println!("waiting for API response");
+        match receiver.await {
+            Ok(response) => {
+                return response;
+            },
+            _ => {
+                println!("Receive Error");
+                return "0.0.0.0:0".parse().unwrap();
+            },
+        }
+    }
+}
+
+impl EndpointChooser for ApiEndpointChooser {
+    fn choose_endpoints(&self, endpoints: &mut UpstreamEndpoints, from: SocketAddr) {
+        println!("ApiEndpointChooser");
+
+        let (sender, receiver) = oneshot::channel::<SocketAddr>();
+        let message = (from, sender);
+
+        match futures::executor::block_on(self.txmt.send(message)) {
+            Ok(()) => {
+                println!("sent ok")
+            },
+            Err(e) => {
+                println!("send error {:?}", e)
+            },
+        };
+
+        let response = futures::executor::block_on(ApiEndpointChooser::get(receiver));
+
+        match endpoints.retain(| ep | ep.address == response) {
+            RetainedItems::Some(count) => {
+                println!("{} endpoints retained", count);
+            },
+            RetainedItems::All => {
+                println!("All endpoints retained");
+            },
+            RetainedItems::None => {
+                println!("No endpoints retained");
+            },
+        }
     }
 }
