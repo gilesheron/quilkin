@@ -26,9 +26,15 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::TryRecvError;
+use tokio::time::{sleep, Duration};
 
-use crate::endpoint::{UpstreamEndpoints, RetainedItems};
+use futures::future::BoxFuture;
+
+use crate::endpoint::UpstreamEndpoints;
+use crate::endpoint::RetainedItems;
 
 /// EndpointChooser chooses from a set of endpoints that a proxy is connected to.
 pub trait EndpointChooser: Send + Sync {
@@ -120,20 +126,18 @@ impl ApiEndpointChooser {
                                 Ok(response) => {
                                     println!("RESPONSE={:?}", response);
 
-                                    let msg = response.into_inner();
-                                    match msg.res.parse() {
-                                        Ok(socket_addr) => {
-                                            match channel.send(socket_addr) {
-                                                Ok(()) => {
-                                                    println!("Response sent ok");
-                                                }
-                                                Err(e) => {
-                                                    println!("Error {:?} sending response {:?}", e, socket_addr);
-                                                }
-                                            }
+                                    let msg = response.into_inner().res;
+                                    let socket_addr: SocketAddr = msg.parse().unwrap();
+
+                                    println!("message {}", msg);
+                                    println!("socket addr {}", socket_addr.to_string());
+
+                                    match channel.send(socket_addr) {
+                                        Ok(()) => {
+                                            println!("Response sent ok");
                                         },
                                         Err(e) => {
-                                            println!("Error converting response to SocketAddr {:?}", e);
+                                            println!("Oneshot error {:?}", e);
                                         }
                                     }
                                 },
@@ -154,17 +158,36 @@ impl ApiEndpointChooser {
         };
     }
 
-    async fn get(receiver: oneshot::Receiver<SocketAddr>) -> SocketAddr {
+    fn msg(sender: mpsc::Sender<(SocketAddr, oneshot::Sender<SocketAddr>)>, from: SocketAddr) -> BoxFuture<'static, SocketAddr> {
         println!("waiting for API response");
-        match receiver.await {
-            Ok(response) => {
-                return response;
+        let (shoot_out, mut shoot_in) = oneshot::channel::<SocketAddr>();
+        let message = (from, shoot_out);
+
+        match futures::executor::block_on(sender.send(message)) {
+            Ok(()) => {
+                println!("sent ok")
             },
-            _ => {
-                println!("Receive Error");
-                return "0.0.0.0:0".parse().unwrap();
+            Err(e) => {
+                println!("send error {:?}", e)
             },
         }
+
+        Box::pin( async move {
+            while shoot_in.try_recv() == Err(TryRecvError::Empty) {
+                sleep(Duration::from_millis(1)).await;
+                println!("waiting");
+            }
+
+            match shoot_in.try_recv() {
+                Ok(response) => {
+                    return response
+                },
+                _ => {
+                    println!("Receive Error");
+                    return "0.0.0.0:0".parse().unwrap()
+                },
+            }
+        })
     }
 }
 
@@ -172,21 +195,14 @@ impl EndpointChooser for ApiEndpointChooser {
     fn choose_endpoints(&self, endpoints: &mut UpstreamEndpoints, from: SocketAddr) {
         println!("ApiEndpointChooser");
 
-        let (sender, receiver) = oneshot::channel::<SocketAddr>();
-        let message = (from, sender);
+        let endpoint = from;
 
-        match futures::executor::block_on(self.txmt.send(message)) {
-            Ok(()) => {
-                println!("sent ok")
-            },
-            Err(e) => {
-                println!("send error {:?}", e)
-            },
-        };
+        let sender = self.txmt.clone();
+        let source = from.clone();
 
-        let response = futures::executor::block_on(ApiEndpointChooser::get(receiver));
+        let _result = ApiEndpointChooser::msg(sender, source);
 
-        match endpoints.retain(| ep | ep.address == response) {
+        match endpoints.retain(| ep | ep.address == endpoint) {
             RetainedItems::Some(count) => {
                 println!("{} endpoints retained", count);
             },
