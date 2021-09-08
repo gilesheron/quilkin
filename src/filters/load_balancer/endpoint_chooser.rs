@@ -26,12 +26,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
-use tokio::sync::oneshot::error::TryRecvError;
-use tokio::time::{sleep, Duration};
+use std::sync::mpsc;
+use std::sync::Mutex;
 
-use futures::future::BoxFuture;
+use tokio::sync::oneshot;
 
 use crate::endpoint::UpstreamEndpoints;
 use crate::endpoint::RetainedItems;
@@ -92,78 +90,84 @@ impl EndpointChooser for HashEndpointChooser {
 
 /// ControlPlaneEndpointChooser chooses endpoints from a Control Plane API Call
 pub struct ApiEndpointChooser {
-    txmt: mpsc::Sender<(SocketAddr, oneshot::Sender<SocketAddr>)>,
+    txmt: Mutex<mpsc::Sender<(SocketAddr, oneshot::Sender<SocketAddr>)>>,
 }
 
 impl ApiEndpointChooser {
     pub fn new() -> Self {
         println!("new API chooser");
-        let (tx, rx) = mpsc::channel::<(SocketAddr, oneshot::Sender<SocketAddr>)>(32);
-        tokio::spawn(async {
-            ApiEndpointChooser::run(rx).await;
+        let (tx, rx) = mpsc::channel::<(SocketAddr, oneshot::Sender<SocketAddr>)>();
+        std::thread::spawn( move || {
+            ApiEndpointChooser::run(rx);
         });
-        ApiEndpointChooser { txmt: tx.clone() }
+        ApiEndpointChooser { txmt: Mutex::new(tx.clone()) }
     }
 
-    async fn run(mut rx: mpsc::Receiver<(SocketAddr, oneshot::Sender<SocketAddr>)>) {
-        match GetEndpointClient::connect("http://127.0.0.1:50051").await {
-            Ok(mut client) => {
-                println!("connected to API");
-                loop {
-                    println!("entering loop");
+    fn run(rx: mpsc::Receiver<(SocketAddr, oneshot::Sender<SocketAddr>)>) {
+        println!("run");
 
-                    let _result = match rx.recv().await {
-                        Some((message, channel)) => {
-                            println!("got message");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let eg = rt.enter();
 
-                            let request = tonic::Request::new(
-                                EndpointRequest {
-                                    req: message.to_string(),
-                                }
-                            );
+        let fut = async {
+            match GetEndpointClient::connect("http://127.0.0.1:50051").await {
+                Ok(mut client) => {
+                    println!("connected to API");
+                    loop {
+                        let _result = match rx.recv() {
+                            Ok((message, channel)) => {
+                                println!("got message");
 
-                            match client.send(request).await {
-                                Ok(response) => {
-                                    println!("RESPONSE={:?}", response);
-
-                                    let msg = response.into_inner().res;
-                                    let socket_addr: SocketAddr = msg.parse().unwrap();
-
-                                    println!("message {}", msg);
-                                    println!("socket addr {}", socket_addr.to_string());
-
-                                    match channel.send(socket_addr) {
-                                        Ok(()) => {
-                                            println!("Response sent ok");
-                                        },
-                                        Err(e) => {
-                                            println!("Oneshot error {:?}", e);
-                                        }
+                                let request = tonic::Request::new(
+                                    EndpointRequest {
+                                        req: message.to_string(),
                                     }
-                                },
-                                Err(e) => {
-                                    println!("Send Error {:?}", e);
-                                },
+                                );
+
+                                match client.send(request).await {
+                                    Ok(response) => {
+                                        println!("RESPONSE={:?}", response);
+
+                                        let msg = response.into_inner().res;
+                                        let socket_addr: SocketAddr = msg.parse().unwrap();
+
+                                        match channel.send(socket_addr) {
+                                            Ok(()) => {
+                                                println!("Response sent ok");
+                                            },
+                                            Err(e) => {
+                                                println!("Oneshot error {:?}", e);
+                                            }
+                                        }
+                                    },
+                                    Err(e) => {
+                                        println!("Send Error {:?}", e);
+                                    },
+                                }
+                            },
+                            Err(e) => {
+                                println!("No message received - error {:}", e);
                             }
-                        },
-                        None => {
-                            println!("No message received");
-                        }
-                    };
-                }
-            },
-            Err(e) => {
-                println!("Connect Error {:?}", e);
-            },
+                        };
+                    }
+                },
+                Err(e) => {
+                    println!("Connect Error {:?}", e);
+                },
+            };
         };
+
+        futures::executor::block_on(fut);
+
+        drop(eg);
     }
 
-    fn msg(sender: mpsc::Sender<(SocketAddr, oneshot::Sender<SocketAddr>)>, from: SocketAddr) -> BoxFuture<'static, SocketAddr> {
+    async fn msg(sender: mpsc::Sender<(SocketAddr, oneshot::Sender<SocketAddr>)>, from: SocketAddr) -> SocketAddr {
         println!("waiting for API response");
-        let (shoot_out, mut shoot_in) = oneshot::channel::<SocketAddr>();
+        let (shoot_out, shoot_in) = oneshot::channel::<SocketAddr>();
         let message = (from, shoot_out);
 
-        match futures::executor::block_on(sender.send(message)) {
+        match sender.send(message) {
             Ok(()) => {
                 println!("sent ok")
             },
@@ -172,22 +176,16 @@ impl ApiEndpointChooser {
             },
         }
 
-        Box::pin( async move {
-            while shoot_in.try_recv() == Err(TryRecvError::Empty) {
-                sleep(Duration::from_millis(1)).await;
-                println!("waiting");
-            }
-
-            match shoot_in.try_recv() {
-                Ok(response) => {
-                    return response
-                },
-                _ => {
-                    println!("Receive Error");
-                    return "0.0.0.0:0".parse().unwrap()
-                },
-            }
-        })
+        match shoot_in.await {
+            Ok(response) => {
+                println!("Received ok {}", response.to_string());
+                return response
+            },
+            Err(e) => {
+                println!("Receive Error {:?}", e);
+                return "0.0.0.0:0".parse().unwrap()
+            },
+        }
     }
 }
 
@@ -195,12 +193,15 @@ impl EndpointChooser for ApiEndpointChooser {
     fn choose_endpoints(&self, endpoints: &mut UpstreamEndpoints, from: SocketAddr) {
         println!("ApiEndpointChooser");
 
-        let endpoint = from;
-
-        let sender = self.txmt.clone();
+        let sender = self.txmt.lock().unwrap().clone();
         let source = from.clone();
 
-        let _result = ApiEndpointChooser::msg(sender, source);
+        let handle = tokio::runtime::Handle::current();
+        let eg = handle.enter();
+
+        let endpoint = futures::executor::block_on(ApiEndpointChooser::msg(sender, source));
+
+        drop(eg);
 
         match endpoints.retain(| ep | ep.address == endpoint) {
             RetainedItems::Some(count) => {
