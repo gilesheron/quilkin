@@ -97,6 +97,8 @@ impl ApiEndpointChooser {
     pub fn new() -> Self {
         println!("new API chooser");
         let (tx, rx) = mpsc::channel::<(SocketAddr, oneshot::Sender<SocketAddr>)>();
+
+        /// Spawn API client thread
         std::thread::spawn( move || {
             ApiEndpointChooser::run(rx);
         });
@@ -106,9 +108,11 @@ impl ApiEndpointChooser {
     fn run(rx: mpsc::Receiver<(SocketAddr, oneshot::Sender<SocketAddr>)>) {
         println!("run");
 
+        ///  Create and enter Tokio runtime for API client thread
         let rt = tokio::runtime::Runtime::new().unwrap();
         let eg = rt.enter();
 
+        /// API thread runs async (as uses tonic etc.) and never terminates
         let fut = async {
             match GetEndpointClient::connect("http://127.0.0.1:50051").await {
                 Ok(mut client) => {
@@ -159,14 +163,15 @@ impl ApiEndpointChooser {
 
         futures::executor::block_on(fut);
 
+        /// Compiler needs this but thread will never terminate....
         drop(eg);
     }
 
     async fn msg(sender: mpsc::Sender<(SocketAddr, oneshot::Sender<SocketAddr>)>, from: SocketAddr) -> SocketAddr {
-        println!("waiting for API response");
         let (shoot_out, shoot_in) = oneshot::channel::<SocketAddr>();
         let message = (from, shoot_out);
 
+        /// Send message to API thread
         match sender.send(message) {
             Ok(()) => {
                 println!("sent ok")
@@ -176,6 +181,7 @@ impl ApiEndpointChooser {
             },
         }
 
+        /// Get oneshot response
         match shoot_in.await {
             Ok(response) => {
                 println!("Received ok {}", response.to_string());
@@ -193,14 +199,15 @@ impl EndpointChooser for ApiEndpointChooser {
     fn choose_endpoints(&self, endpoints: &mut UpstreamEndpoints, from: SocketAddr) {
         println!("ApiEndpointChooser");
 
+        /// Need to add caching here
+
         let sender = self.txmt.lock().unwrap().clone();
         let source = from.clone();
 
+        /// Make async call from sync fn (we know we're actually running under Tokio)
         let handle = tokio::runtime::Handle::current();
         let eg = handle.enter();
-
         let endpoint = futures::executor::block_on(ApiEndpointChooser::msg(sender, source));
-
         drop(eg);
 
         match endpoints.retain(| ep | ep.address == endpoint) {
