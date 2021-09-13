@@ -21,6 +21,9 @@ use crate::filters::{prelude::*, DynFilterFactory};
 
 use config::ProtoConfig;
 use endpoint_chooser::EndpointChooser;
+use crate::endpoint::RetainedItems;
+
+use std::net::SocketAddr;
 
 pub use config::{Config, Policy};
 
@@ -38,8 +41,32 @@ struct LoadBalancer {
 
 impl Filter for LoadBalancer {
     fn read(&self, mut ctx: ReadContext) -> Option<ReadResponse> {
-        self.endpoint_chooser
-            .choose_endpoints(&mut ctx.endpoints, ctx.from);
+        let endpoint: SocketAddr;
+
+        match flow_cache.get(&ctx.from) {
+            Some(ep_ref) => {
+                println!("found endpoint {:?} in cache", *ep_ref);
+                endpoint = *ep_ref;
+            }
+            None => {
+                endpoint = self.endpoint_chooser
+                                .choose_endpoints(&mut ctx.endpoints, ctx.from);
+                flow_cache.insert(ctx.from, endpoint);
+            }
+        }
+
+        match ctx.endpoints.retain(| ep | ep.address == endpoint) {
+            RetainedItems::Some(count) => {
+                println!("{} endpoints retained", count);
+            },
+            RetainedItems::All => {
+                println!("All endpoints retained");
+            },
+            RetainedItems::None => {
+                println!("No endpoints retained");
+            },
+        }
+
         Some(ctx.into())
     }
 }

@@ -202,6 +202,14 @@ impl UpstreamEndpoints {
             .unwrap_or_else(|| self.endpoints.0.len())
     }
 
+    pub fn get(&self, index: usize) -> Option<SocketAddr> {
+        if index >= self.size() {
+            return None;
+        }
+
+        Some(self.endpoints.as_ref()[index].address)
+    }
+
     /// Updates the current subset of endpoints to contain only the endpoint
     /// at the specified zero-indexed position, returns `None` if `index`
     /// is greater than the number of endpoints.
