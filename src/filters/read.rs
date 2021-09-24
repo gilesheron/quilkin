@@ -21,7 +21,7 @@ use crate::endpoint::UpstreamEndpoints;
 use crate::filters::Filter;
 
 /// Shared state between [`Filter`]s during processing for a single packet.
-type DynamicMetadata = HashMap<Arc<String>, Box<dyn Any + Send>>;
+pub type DynamicMetadata = HashMap<Arc<String>, Box<dyn Any + Send>>;
 
 /// The input arguments to [`Filter::read`].
 #[non_exhaustive]
@@ -54,6 +54,16 @@ impl ReadContext {
             from,
             contents: response.contents,
             metadata: response.metadata,
+        }
+    }
+
+    /// Creats a new ['ReadContext'] with metadata.
+    pub fn with_metadata(endpoints: UpstreamEndpoints, from: SocketAddr, contents: Vec<u8>, metadata: DynamicMetadata) -> Self {
+        Self {
+            endpoints,
+            from,
+            contents,
+            metadata,
         }
     }
 }

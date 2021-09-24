@@ -20,3 +20,5 @@
 /// byte slices it extracts from each packet.
 /// - **Type** `Vec<u8>`
 pub const CAPTURED_BYTES: &str = "quilkin.dev/captured_bytes";
+pub const CACHED_ENDPOINT: &str = "quilkin.dev/cached_endpoint";
+pub const NEW_ENDPOINT: &str = "quilkin/dev/new_endpoint";

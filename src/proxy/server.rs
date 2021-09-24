@@ -24,12 +24,15 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use metrics::Metrics as ProxyMetrics;
 use resource_manager::{DynamicResourceManagers, StaticResourceManagers};
 
 use crate::cluster::cluster_manager::SharedClusterManager;
 use crate::endpoint::Endpoint;
-use crate::filters::{manager::SharedFilterManager, Filter, FilterRegistry, ReadContext};
+use crate::filters::{manager::SharedFilterManager, Filter, FilterRegistry, ReadContext, DynamicMetadata};
 use crate::proxy::builder::{ValidatedConfig, ValidatedSource};
 use crate::proxy::server::error::Error;
 use crate::proxy::sessions::metrics::Metrics as SessionMetrics;
@@ -37,6 +40,9 @@ use crate::proxy::sessions::session_manager::SessionManager;
 use crate::proxy::sessions::{Packet, Session, SessionKey, SESSION_TIMEOUT_SECONDS};
 use crate::proxy::Admin;
 use crate::utils::debug;
+use crate::proxy::flow::FlowCache;
+
+use crate::filters::metadata::{CACHED_ENDPOINT, NEW_ENDPOINT};
 
 use super::metrics::Metrics;
 
@@ -233,9 +239,6 @@ impl Server {
         // and place them onto the worker tasks' queue for processing.
         let socket = args.socket;
         tokio::spawn(async move {
-            // Index to round-robin over workers to process packets.
-            let mut next_worker = 0;
-            let num_workers = num_workers;
 
             // Initialize a buffer for the UDP packet. We use the maximum size of a UDP
             // packet, which is the maximum value of 16 a bit integer.
@@ -243,8 +246,10 @@ impl Server {
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((size, recv_addr)) => {
-                        let packet_tx = &mut packet_txs[next_worker % num_workers];
-                        next_worker += 1;
+                        println!("recv addr is {:?}", recv_addr);
+                        let mut hasher = DefaultHasher::new();
+                        recv_addr.hash(&mut hasher);
+                        let packet_tx = &mut packet_txs[hasher.finish() as usize% num_workers];
 
                         if packet_tx
                             .send((recv_addr, (&buf[..size]).to_vec()))
@@ -286,11 +291,22 @@ impl Server {
             let log = log.clone();
 
             tokio::spawn(async move {
+                println!("spawning worker");
+                let mut flow_cache = FlowCache::new();
+
                 loop {
                     tokio::select! {
                       packet = packet_rx.recv() => {
                         match packet {
-                          Some((recv_addr, packet)) => Self::process_downstream_received_packet((recv_addr, packet), &receive_config).await,
+                          Some((recv_addr, packet)) => {
+                            match Self::process_downstream_received_packet((recv_addr, packet), &receive_config, flow_cache.clone()).await {
+                              Some(endpoint) => {
+                                println!("inserting key {:?} into cache, value {:?}", recv_addr, endpoint);
+                                flow_cache.insert(&recv_addr, &endpoint);
+                              }
+                              None => {}
+                            }
+                          }
                           None => {
                             debug!(log, "Worker-{} exiting: work sender channel was closed.", worker_id);
                             return;
@@ -311,7 +327,8 @@ impl Server {
     async fn process_downstream_received_packet(
         packet: (SocketAddr, Vec<u8>),
         args: &ProcessDownstreamReceiveConfig,
-    ) {
+        mut flow_cache: FlowCache,
+    ) -> Option<SocketAddr> {
         let (recv_addr, packet) = packet;
 
         trace!(
@@ -325,21 +342,39 @@ impl Server {
             Some(endpoints) => endpoints,
             None => {
                 args.proxy_metrics.packets_dropped_no_endpoints.inc();
-                return;
+                return None;
             }
         };
+
+        let mut metadata = DynamicMetadata::new();
+
+        if let Some(ep_ref) = flow_cache.get(&recv_addr) {
+            let endpoint = *ep_ref;
+            metadata.insert(Arc::new(CACHED_ENDPOINT.to_string()), Box::new(endpoint));
+            println!("inserted metadata {:?}", endpoint);
+        }
 
         let filter_chain = {
             let filter_manager_guard = args.filter_manager.read();
             filter_manager_guard.get_filter_chain()
         };
-        let result = filter_chain.read(ReadContext::new(endpoints, recv_addr, packet));
+        let result = filter_chain.read(ReadContext::with_metadata(endpoints, recv_addr, packet, metadata));
 
         if let Some(response) = result {
             for endpoint in response.endpoints.iter() {
                 Self::session_send_packet(&response.contents, recv_addr, endpoint, args).await;
             }
+
+            if let Some(value) = response.metadata.get(&Arc::new(NEW_ENDPOINT.to_string())) {
+                println!("found new metadata");
+                if let Some(ep_ref) = value.downcast_ref::<SocketAddr>() {
+                    println!("found new endpoint {:?}", *ep_ref);
+                    return Some(*ep_ref);
+                }
+            }
         }
+
+        None
     }
 
     /// Send a packet received from `recv_addr` to an endpoint.
@@ -675,6 +710,7 @@ mod tests {
                         session_manager: session_manager.clone(),
                         session_ttl: Duration::from_secs(10),
                         send_packets: send_packets.clone(),
+                        flow_cache: flow_cache.clone(),
                     },
                 })
             }

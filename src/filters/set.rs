@@ -60,7 +60,7 @@ impl FilterSet {
                 filters::debug::factory(base),
                 filters::local_rate_limit::factory(),
                 filters::concatenate_bytes::factory(),
-                filters::load_balancer::factory(),
+                filters::load_balancer::factory(base),
                 filters::capture_bytes::factory(base),
                 filters::token_router::factory(base),
                 filters::compress::factory(base),

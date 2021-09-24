@@ -40,7 +40,7 @@ pub mod token_router;
 pub mod prelude {
     pub use super::{
         ConvertProtoConfigError, CreateFilterArgs, DynFilterFactory, Error, Filter, FilterFactory,
-        ReadContext, ReadResponse, WriteContext, WriteResponse,
+        ReadContext, ReadResponse, WriteContext, WriteResponse, DynamicMetadata,
     };
 }
 
@@ -48,7 +48,7 @@ pub mod prelude {
 pub use self::{
     error::{ConvertProtoConfigError, Error},
     factory::{CreateFilterArgs, DynFilterFactory, FilterFactory},
-    read::{ReadContext, ReadResponse},
+    read::{ReadContext, ReadResponse, DynamicMetadata},
     registry::FilterRegistry,
     set::{FilterMap, FilterSet},
     write::{WriteContext, WriteResponse},

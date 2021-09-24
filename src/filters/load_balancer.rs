@@ -16,8 +16,14 @@
 
 mod config;
 mod endpoint_chooser;
+mod metrics;
 
-use crate::filters::{prelude::*, DynFilterFactory};
+use std::sync::Arc;
+
+use crate::filters::{metadata::{CACHED_ENDPOINT, NEW_ENDPOINT}, prelude::*, DynFilterFactory};
+
+use slog::{error, o, Logger};
+use metrics::Metrics;
 
 use config::ProtoConfig;
 use endpoint_chooser::EndpointChooser;
@@ -30,28 +36,42 @@ pub use config::{Config, Policy};
 pub const NAME: &str = "quilkin.extensions.filters.load_balancer.v1alpha1.LoadBalancer";
 
 /// Returns a factory for creating load balancing filters.
-pub fn factory() -> DynFilterFactory {
-    Box::from(LoadBalancerFilterFactory)
+pub fn factory(base: &Logger) -> DynFilterFactory {
+    Box::from(LoadBalancerFilterFactory::new(base))
 }
 
 /// Balances packets over the upstream endpoints.
 struct LoadBalancer {
     endpoint_chooser: Box<dyn EndpointChooser>,
+    log: Logger,
+    metrics: Metrics,
 }
 
 impl Filter for LoadBalancer {
     fn read(&self, mut ctx: ReadContext) -> Option<ReadResponse> {
         let endpoint: SocketAddr;
 
-        match flow_cache.get(&ctx.from) {
-            Some(ep_ref) => {
-                println!("found endpoint {:?} in cache", *ep_ref);
-                endpoint = *ep_ref;
+        match ctx.metadata.get(&Arc::new(CACHED_ENDPOINT.to_string())) {
+            Some(value) => match value.downcast_ref::<SocketAddr>() {
+                Some(ep_ref) => {
+                    println!("found endpoint {:?} in cache", *ep_ref);
+                    endpoint = *ep_ref;
+                },
+                None => {
+                    error!(
+                        self.log,
+                        "Packets are being dropped as cached endpint has invalid type: expected SocketAddr";
+                        "count" => self.metrics.packets_dropped_invalid_cached_endpoint.get()
+                    );
+                    self.metrics.packets_dropped_invalid_cached_endpoint.inc();
+                    return None;
+                }
             }
             None => {
                 endpoint = self.endpoint_chooser
                                 .choose_endpoints(&mut ctx.endpoints, ctx.from);
-                flow_cache.insert(ctx.from, endpoint);
+                println!("chosen endpoint {:?}", endpoint);
+                ctx.metadata.insert(Arc::new(NEW_ENDPOINT.to_string()), Box::new(endpoint));
             }
         }
 
@@ -71,7 +91,26 @@ impl Filter for LoadBalancer {
     }
 }
 
-struct LoadBalancerFilterFactory;
+impl LoadBalancer {
+    fn new(endpoint_chooser: Box<dyn EndpointChooser>, base: &Logger, metrics: Metrics) -> Self {
+        Self {
+            endpoint_chooser,
+            log: base.new(o!("source" => "extensions::TokenRouter")),
+            metrics,
+        }
+    }
+}
+
+/// Factory for the LoadBalancer filter
+struct LoadBalancerFilterFactory {
+    log: Logger,
+}
+
+impl LoadBalancerFilterFactory {
+    pub fn new(base: &Logger) -> Self {
+        LoadBalancerFilterFactory { log: base.clone() }
+    }
+}
 
 impl FilterFactory for LoadBalancerFilterFactory {
     fn name(&self) -> &'static str {
@@ -83,9 +122,11 @@ impl FilterFactory for LoadBalancerFilterFactory {
             .require_config(args.config)?
             .deserialize::<Config, ProtoConfig>(self.name())?;
 
-        Ok(Box::new(LoadBalancer {
-            endpoint_chooser: config.policy.as_endpoint_chooser(),
-        }))
+        Ok(Box::new(LoadBalancer::new (
+            config.policy.as_endpoint_chooser(),
+            &self.log,
+            Metrics::new(&args.metrics_registry)?,
+        )))
     }
 }
 
